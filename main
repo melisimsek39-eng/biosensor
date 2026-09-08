@@ -1,1 +1,1837 @@
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 
+/*
+   =========================================================
+                  SMART SLEEP WRISTBAND
+   =========================================================
+
+   PRODUCT FUNCTIONS:
+
+   1. Reads PPG signal from inside of wrist
+   2. Cleans PPG signal
+   3. Uses motion information to reject motion artifacts
+   4. Calculates approximate heart rate
+   5. Learns the individual user's resting heart pattern
+   6. Determines SLEEPING vs AWAKE
+   7. Tracks CUMULATIVE sleep time
+   8. Pauses sleep timer when user wakes up
+   9. Continues timer when user falls asleep again
+   10. User chooses desired amount of sleep
+   11. Wakes user when cumulative sleep goal is reached
+   12. Allows "Stay Awake" periods
+   13. Detects possible falling asleep during those periods
+   14. Activates a vibration alert
+   15. Sends data through Bluetooth Low Energy to an app
+   16. Sends data needed for app graphs/charts
+
+   NOTE:
+   Sleep detection is a prototype estimate and is NOT
+   intended to be used as a medical sleep-monitoring device.
+*/
+
+
+// =========================================================
+// PIN DEFINITIONS
+// =========================================================
+
+// PPG sensor
+const int PPG_PIN = 34;
+
+// Accelerometer / motion sensor
+// For a prototype this can represent the motion magnitude.
+// A real accelerometer would normally communicate through I2C.
+const int MOTION_PIN = 35;
+
+// Vibration motor for haptic wake-up
+const int VIBRATION_PIN = 25;
+
+// Optional buzzer for normal sleep alarm
+const int BUZZER_PIN = 26;
+
+
+// =========================================================
+// BLUETOOTH SETTINGS
+// =========================================================
+
+// Nordic-UART-style BLE service
+
+#define SERVICE_UUID \
+  "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+
+#define CHARACTERISTIC_UUID_RX \
+  "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+
+#define CHARACTERISTIC_UUID_TX \
+  "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+
+
+BLEServer *pServer = NULL;
+
+BLECharacteristic *pTxCharacteristic = NULL;
+
+bool deviceConnected = false;
+
+bool oldDeviceConnected = false;
+
+
+// =========================================================
+// USER SETTINGS
+// =========================================================
+
+// Default sleep goal
+float desiredSleepHours = 8.0;
+
+// Has the user pressed START SLEEP TRACKING?
+bool trackingEnabled = false;
+
+// Stay Awake can also be manually switched on.
+bool manualStayAwake = false;
+
+
+// =========================================================
+// SLEEP VARIABLES
+// =========================================================
+
+bool isSleeping = false;
+
+bool wasSleeping = false;
+
+bool sleepLikeCondition = false;
+
+unsigned long totalSleepTime = 0;
+
+unsigned long previousLoopTime = 0;
+
+unsigned long possibleSleepStart = 0;
+
+unsigned long possibleWakeStart = 0;
+
+
+// For demonstration this is 30 seconds.
+// In a real product this would probably be several minutes.
+const unsigned long SLEEP_CONFIRM_TIME = 30000;
+
+
+// User must look awake for 10 seconds before
+// changing from sleeping -> awake.
+const unsigned long WAKE_CONFIRM_TIME = 10000;
+
+
+// =========================================================
+// PPG FILTER VARIABLES
+// =========================================================
+
+const int FILTER_SIZE = 12;
+
+int ppgBuffer[FILTER_SIZE];
+
+int ppgIndex = 0;
+
+long ppgTotal = 0;
+
+float filteredPPG = 0;
+
+float previousFilteredPPG = 0;
+
+float ppgBaseline = 0;
+
+float ppgEnvelope = 10;
+
+
+// =========================================================
+// MOTION VARIABLES
+// =========================================================
+
+int motionValue = 0;
+
+// Higher values mean more movement.
+const int MOTION_THRESHOLD = 120;
+
+bool signalReliable = true;
+
+
+// =========================================================
+// HEART RATE VARIABLES
+// =========================================================
+
+float heartRate = 72.0;
+
+float personalizedRestingHR = 72.0;
+
+bool baselineReady = false;
+
+unsigned long lastBeatTime = 0;
+
+float previousACSignal = 0;
+
+
+// =========================================================
+// PERSONAL CALIBRATION
+// =========================================================
+
+bool calibrating = false;
+
+float calibrationTotal = 0;
+
+int calibrationSamples = 0;
+
+unsigned long calibrationStartTime = 0;
+
+
+// 30 second calibration
+const unsigned long CALIBRATION_TIME = 30000;
+
+
+// =========================================================
+// ALARM VARIABLES
+// =========================================================
+
+bool sleepGoalReached = false;
+
+unsigned long lastStayAwakeAlert = 0;
+
+
+// =========================================================
+// TIME / STAY-AWAKE SCHEDULE
+// =========================================================
+
+// The app sends the current time as minutes after midnight.
+//
+// Example:
+// 9:30 AM = 570
+// 2:00 PM = 840
+
+int currentMinuteOfDay = 0;
+
+
+// Maximum number of scheduled "Do Not Sleep" periods
+const int MAX_WINDOWS = 5;
+
+int stayAwakeStart[MAX_WINDOWS];
+
+int stayAwakeEnd[MAX_WINDOWS];
+
+int windowCount = 0;
+
+
+// =========================================================
+// FUNCTION DECLARATIONS
+// =========================================================
+
+void handleCommand(String command);
+
+void sendBluetoothMessage(String message);
+
+void sendAppData();
+
+float cleanPPG(int rawValue);
+
+void calculateHeartRate();
+
+void detectSleep();
+
+void checkSleepGoal();
+
+void checkStayAwake();
+
+bool stayAwakeActive();
+
+bool timeInsideWindow(int currentTime, int startTime, int endTime);
+
+void vibrationAlert();
+
+void sleepGoalAlarm();
+
+void startCalibration();
+
+void performCalibration();
+
+void showStatus();
+
+void resetNight();
+
+
+// =========================================================
+// BLUETOOTH CONNECTION CALLBACK
+// =========================================================
+
+class ServerCallbacks : public BLEServerCallbacks {
+
+  void onConnect(BLEServer *server) {
+
+    deviceConnected = true;
+
+    Serial.println("Phone connected to SleepBand.");
+
+  }
+
+
+  void onDisconnect(BLEServer *server) {
+
+    deviceConnected = false;
+
+    Serial.println("Phone disconnected.");
+
+  }
+
+};
+
+
+// =========================================================
+// RECEIVE COMMANDS FROM APP
+// =========================================================
+
+class AppCommandCallbacks : public BLECharacteristicCallbacks {
+
+  void onWrite(BLECharacteristic *characteristic) {
+
+    String command = characteristic->getValue();
+
+    if (command.length() > 0) {
+
+      command.trim();
+
+      Serial.print("APP COMMAND: ");
+
+      Serial.println(command);
+
+      handleCommand(command);
+
+    }
+
+  }
+
+};
+
+
+// =========================================================
+// SETUP
+// =========================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+
+  // -----------------------------
+  // PINS
+  // -----------------------------
+
+  pinMode(PPG_PIN, INPUT);
+
+  pinMode(MOTION_PIN, INPUT);
+
+  pinMode(VIBRATION_PIN, OUTPUT);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+
+
+  digitalWrite(VIBRATION_PIN, LOW);
+
+  digitalWrite(BUZZER_PIN, LOW);
+
+
+  // -----------------------------
+  // FILTER ARRAY
+  // -----------------------------
+
+  for (int i = 0; i < FILTER_SIZE; i++) {
+
+    ppgBuffer[i] = 0;
+
+  }
+
+
+  previousLoopTime = millis();
+
+
+  // -----------------------------
+  // BLUETOOTH
+  // -----------------------------
+
+  BLEDevice::init("SleepBand");
+
+
+  pServer = BLEDevice::createServer();
+
+  pServer->setCallbacks(new ServerCallbacks());
+
+
+  BLEService *service =
+    pServer->createService(SERVICE_UUID);
+
+
+  // Data sent FROM wristband TO phone
+
+  pTxCharacteristic =
+    service->createCharacteristic(
+      CHARACTERISTIC_UUID_TX,
+      BLECharacteristic::PROPERTY_NOTIFY
+    );
+
+
+  pTxCharacteristic->addDescriptor(
+    new BLE2902()
+  );
+
+
+  // Data sent FROM phone TO wristband
+
+  BLECharacteristic *rxCharacteristic =
+    service->createCharacteristic(
+      CHARACTERISTIC_UUID_RX,
+      BLECharacteristic::PROPERTY_WRITE
+    );
+
+
+  rxCharacteristic->setCallbacks(
+    new AppCommandCallbacks()
+  );
+
+
+  service->start();
+
+
+  BLEAdvertising *advertising =
+    BLEDevice::getAdvertising();
+
+
+  advertising->addServiceUUID(SERVICE_UUID);
+
+  advertising->setScanResponse(true);
+
+  BLEDevice::startAdvertising();
+
+
+  // -----------------------------
+  // STARTUP MESSAGE
+  // -----------------------------
+
+  Serial.println();
+
+  Serial.println("==============================");
+
+  Serial.println("       SLEEPBAND READY");
+
+  Serial.println("==============================");
+
+  Serial.println();
+
+  Serial.println("Waiting for phone connection...");
+
+}
+
+
+// =========================================================
+// MAIN LOOP
+// =========================================================
+
+void loop() {
+
+  unsigned long currentTime = millis();
+
+  unsigned long elapsedTime =
+    currentTime - previousLoopTime;
+
+  previousLoopTime = currentTime;
+
+
+  // =====================================================
+  // READ SENSOR INFORMATION
+  // =====================================================
+
+  int rawPPG = analogRead(PPG_PIN);
+
+  motionValue = analogRead(MOTION_PIN);
+
+
+  // =====================================================
+  // REMOVE MOTION ARTIFACTS / CLEAN PPG
+  // =====================================================
+
+  filteredPPG = cleanPPG(rawPPG);
+
+
+  // =====================================================
+  // CALCULATE HEART RATE
+  // =====================================================
+
+  calculateHeartRate();
+
+
+  // =====================================================
+  // PERSONAL HEART PATTERN CALIBRATION
+  // =====================================================
+
+  if (calibrating) {
+
+    performCalibration();
+
+  }
+
+
+  // =====================================================
+  // DETECT SLEEP / AWAKE STATE
+  // =====================================================
+
+  detectSleep();
+
+
+  // =====================================================
+  // CUMULATIVE SLEEP TIMER
+  // =====================================================
+
+  if (trackingEnabled && isSleeping) {
+
+    totalSleepTime += elapsedTime;
+
+  }
+
+
+  // =====================================================
+  // CHECK SLEEP GOAL
+  // =====================================================
+
+  if (trackingEnabled) {
+
+    checkSleepGoal();
+
+  }
+
+
+  // =====================================================
+  // CHECK STAY-AWAKE FEATURE
+  // =====================================================
+
+  checkStayAwake();
+
+
+  // =====================================================
+  // SEND DATA TO PHONE
+  // =====================================================
+
+  sendAppData();
+
+
+  // =====================================================
+  // HANDLE BLUETOOTH RECONNECTION
+  // =====================================================
+
+  if (!deviceConnected && oldDeviceConnected) {
+
+    delay(500);
+
+    pServer->startAdvertising();
+
+    Serial.println("Bluetooth advertising restarted.");
+
+    oldDeviceConnected = deviceConnected;
+
+  }
+
+
+  if (deviceConnected && !oldDeviceConnected) {
+
+    oldDeviceConnected = deviceConnected;
+
+  }
+
+
+  // 25 samples per second
+
+  delay(40);
+
+}
+
+
+// =========================================================
+// CLEAN PPG SIGNAL
+// =========================================================
+
+float cleanPPG(int rawValue) {
+
+  /*
+     MOTION ARTIFACT REMOVAL
+
+     PPG measurements can become inaccurate when the person's
+     wrist moves.
+
+     This prototype uses:
+
+     1. Moving average filtering
+     2. Sudden-change rejection
+     3. Motion sensor information
+
+  */
+
+
+  // Remove oldest value
+
+  ppgTotal -= ppgBuffer[ppgIndex];
+
+
+  // Add newest value
+
+  ppgBuffer[ppgIndex] = rawValue;
+
+  ppgTotal += rawValue;
+
+
+  ppgIndex++;
+
+  if (ppgIndex >= FILTER_SIZE) {
+
+    ppgIndex = 0;
+
+  }
+
+
+  // Moving average
+
+  float average =
+    (float)ppgTotal / FILTER_SIZE;
+
+
+  // Detect sudden signal jump
+
+  float signalChange =
+    abs(average - previousFilteredPPG);
+
+
+  // Motion artifact detection
+
+  if (motionValue > MOTION_THRESHOLD) {
+
+    signalReliable = false;
+
+  }
+
+  else if (signalChange > 300) {
+
+    signalReliable = false;
+
+  }
+
+  else {
+
+    signalReliable = true;
+
+  }
+
+
+  // If signal is unreliable, avoid allowing
+  // the sudden motion artifact to alter our PPG value.
+
+  if (!signalReliable) {
+
+    return previousFilteredPPG;
+
+  }
+
+
+  // Exponential smoothing
+
+  float cleanedSignal =
+    0.80 * previousFilteredPPG
+    +
+    0.20 * average;
+
+
+  previousFilteredPPG = cleanedSignal;
+
+
+  return cleanedSignal;
+
+}
+
+
+// =========================================================
+// HEART RATE CALCULATION
+// =========================================================
+
+void calculateHeartRate() {
+
+  if (!signalReliable) {
+
+    return;
+
+  }
+
+
+  /*
+     Separate the pulsating portion of PPG from
+     its slowly changing baseline.
+  */
+
+  if (ppgBaseline == 0) {
+
+    ppgBaseline = filteredPPG;
+
+  }
+
+
+  ppgBaseline =
+    (0.995 * ppgBaseline)
+    +
+    (0.005 * filteredPPG);
+
+
+  float acSignal =
+    filteredPPG - ppgBaseline;
+
+
+  // Track typical signal amplitude.
+
+  ppgEnvelope =
+    (0.95 * ppgEnvelope)
+    +
+    (0.05 * abs(acSignal));
+
+
+  float beatThreshold =
+    ppgEnvelope * 0.65;
+
+
+  if (beatThreshold < 5) {
+
+    beatThreshold = 5;
+
+  }
+
+
+  // Detect upward crossing of pulse threshold.
+
+  bool pulseDetected =
+
+    acSignal > beatThreshold
+
+    &&
+
+    previousACSignal <= beatThreshold;
+
+
+  if (pulseDetected) {
+
+    unsigned long currentBeatTime = millis();
+
+
+    if (lastBeatTime > 0) {
+
+      unsigned long beatInterval =
+        currentBeatTime - lastBeatTime;
+
+
+      // Accept physiologically reasonable pulse intervals.
+
+      if (beatInterval >= 300 &&
+          beatInterval <= 2000) {
+
+        float newHeartRate =
+          60000.0 / beatInterval;
+
+
+        // Smooth HR instead of jumping instantly.
+
+        heartRate =
+          (0.75 * heartRate)
+          +
+          (0.25 * newHeartRate);
+
+      }
+
+    }
+
+
+    lastBeatTime = currentBeatTime;
+
+  }
+
+
+  previousACSignal = acSignal;
+
+}
+
+
+// =========================================================
+// PERSONALIZED HEART PATTERN
+// =========================================================
+
+void startCalibration() {
+
+  calibrating = true;
+
+  calibrationTotal = 0;
+
+  calibrationSamples = 0;
+
+  calibrationStartTime = millis();
+
+  sendBluetoothMessage(
+    "EVENT=CALIBRATION_STARTED"
+  );
+
+}
+
+
+// =========================================================
+// PERFORM PERSONAL CALIBRATION
+// =========================================================
+
+void performCalibration() {
+
+  /*
+     While the user is awake and relatively still,
+     collect resting heart-rate measurements.
+
+     This gives the device a PERSONAL baseline rather
+     than treating every person exactly the same.
+  */
+
+
+  if (signalReliable &&
+      motionValue < MOTION_THRESHOLD) {
+
+    calibrationTotal += heartRate;
+
+    calibrationSamples++;
+
+  }
+
+
+  if (millis() - calibrationStartTime
+      >= CALIBRATION_TIME) {
+
+
+    if (calibrationSamples > 0) {
+
+      personalizedRestingHR =
+        calibrationTotal /
+        calibrationSamples;
+
+
+      baselineReady = true;
+
+    }
+
+
+    calibrating = false;
+
+
+    String message =
+      "EVENT=CALIBRATION_COMPLETE;BASELINE=";
+
+    message += String(
+      personalizedRestingHR,
+      1
+    );
+
+
+    sendBluetoothMessage(message);
+
+  }
+
+}
+
+
+// =========================================================
+// SLEEP DETECTION
+// =========================================================
+
+void detectSleep() {
+
+  /*
+     Prototype sleep detection combines:
+
+     - low movement
+     - clean PPG signal
+     - heart rate below person's awake/resting baseline
+
+     This is more useful than saying:
+
+           "HR below 65 = sleeping"
+
+     because people's normal heart rates differ.
+  */
+
+
+  bool lowMovement =
+    motionValue < MOTION_THRESHOLD;
+
+
+  float sleepHeartRateThreshold =
+    personalizedRestingHR - 4.0;
+
+
+  bool sleepHeartPattern =
+    heartRate < sleepHeartRateThreshold;
+
+
+  sleepLikeCondition =
+
+    lowMovement
+
+    &&
+
+    sleepHeartPattern
+
+    &&
+
+    signalReliable;
+
+
+  // -----------------------------------------------------
+  // PERSON LOOKS LIKE THEY ARE FALLING ASLEEP
+  // -----------------------------------------------------
+
+  if (sleepLikeCondition) {
+
+    possibleWakeStart = 0;
+
+
+    if (possibleSleepStart == 0) {
+
+      possibleSleepStart = millis();
+
+    }
+
+
+    if (millis() - possibleSleepStart
+        >= SLEEP_CONFIRM_TIME) {
+
+      isSleeping = true;
+
+    }
+
+  }
+
+
+  // -----------------------------------------------------
+  // PERSON LOOKS AWAKE
+  // -----------------------------------------------------
+
+  else {
+
+    possibleSleepStart = 0;
+
+
+    if (isSleeping) {
+
+      if (possibleWakeStart == 0) {
+
+        possibleWakeStart = millis();
+
+      }
+
+
+      if (millis() - possibleWakeStart
+          >= WAKE_CONFIRM_TIME) {
+
+        isSleeping = false;
+
+        possibleWakeStart = 0;
+
+      }
+
+    }
+
+  }
+
+
+  // -----------------------------------------------------
+  // STATE CHANGED: AWAKE -> ASLEEP
+  // -----------------------------------------------------
+
+  if (isSleeping && !wasSleeping) {
+
+    Serial.println("USER FELL ASLEEP");
+
+    sendBluetoothMessage(
+      "EVENT=SLEEP_STARTED"
+    );
+
+  }
+
+
+  // -----------------------------------------------------
+  // STATE CHANGED: ASLEEP -> AWAKE
+  // -----------------------------------------------------
+
+  if (!isSleeping && wasSleeping) {
+
+    Serial.println("USER WOKE UP");
+
+    sendBluetoothMessage(
+      "EVENT=USER_AWAKE"
+    );
+
+  }
+
+
+  wasSleeping = isSleeping;
+
+}
+
+
+// =========================================================
+// CUMULATIVE SLEEP GOAL
+// =========================================================
+
+void checkSleepGoal() {
+
+  unsigned long targetMilliseconds =
+
+    desiredSleepHours
+    *
+    60.0
+    *
+    60.0
+    *
+    1000.0;
+
+
+  if (totalSleepTime >= targetMilliseconds
+
+      &&
+
+      !sleepGoalReached) {
+
+
+    sleepGoalReached = true;
+
+
+    sendBluetoothMessage(
+      "EVENT=SLEEP_GOAL_REACHED"
+    );
+
+
+    sleepGoalAlarm();
+
+  }
+
+}
+
+
+// =========================================================
+// NORMAL WAKE-UP ALARM
+// =========================================================
+
+void sleepGoalAlarm() {
+
+  /*
+      Once the target cumulative sleep is reached:
+
+      PHONE:
+      Receives EVENT=SLEEP_GOAL_REACHED
+      and can play its alarm.
+
+      WRISTBAND:
+      Also vibrates/beeps as backup.
+  */
+
+
+  for (int i = 0; i < 5; i++) {
+
+    digitalWrite(
+      VIBRATION_PIN,
+      HIGH
+    );
+
+
+    digitalWrite(
+      BUZZER_PIN,
+      HIGH
+    );
+
+
+    delay(400);
+
+
+    digitalWrite(
+      VIBRATION_PIN,
+      LOW
+    );
+
+
+    digitalWrite(
+      BUZZER_PIN,
+      LOW
+    );
+
+
+    delay(400);
+
+  }
+
+}
+
+
+// =========================================================
+// CHECK STAY-AWAKE FEATURE
+// =========================================================
+
+void checkStayAwake() {
+
+  if (!stayAwakeActive()) {
+
+    return;
+
+  }
+
+
+  /*
+     We do NOT need to wait until the user is completely
+     classified as asleep.
+
+     If the signal has already begun looking sleep-like,
+     the wristband can provide a light vibration alert.
+  */
+
+
+  if (sleepLikeCondition) {
+
+    if (millis() - lastStayAwakeAlert
+        >= 15000) {
+
+
+      lastStayAwakeAlert = millis();
+
+
+      vibrationAlert();
+
+
+      sendBluetoothMessage(
+        "EVENT=DROWSINESS_ALERT"
+      );
+
+    }
+
+  }
+
+}
+
+
+// =========================================================
+// DETERMINE IF STAY-AWAKE MODE IS ACTIVE
+// =========================================================
+
+bool stayAwakeActive() {
+
+  // User can manually press Stay Awake.
+
+  if (manualStayAwake) {
+
+    return true;
+
+  }
+
+
+  // Or the app can schedule Stay Awake times.
+
+  for (int i = 0; i < windowCount; i++) {
+
+    if (timeInsideWindow(
+
+          currentMinuteOfDay,
+
+          stayAwakeStart[i],
+
+          stayAwakeEnd[i]
+
+        )) {
+
+      return true;
+
+    }
+
+  }
+
+
+  return false;
+
+}
+
+
+// =========================================================
+// CHECK SCHEDULE TIME
+// =========================================================
+
+bool timeInsideWindow(
+
+  int currentTime,
+
+  int startTime,
+
+  int endTime
+
+) {
+
+  // Normal schedule:
+  // example 9:00 AM -> 10:00 AM
+
+  if (startTime <= endTime) {
+
+    return
+
+      currentTime >= startTime
+
+      &&
+
+      currentTime <= endTime;
+
+  }
+
+
+  // Schedule crossing midnight:
+  // example 11:00 PM -> 1:00 AM
+
+  return
+
+    currentTime >= startTime
+
+    ||
+
+    currentTime <= endTime;
+
+}
+
+
+// =========================================================
+// LIGHT VIBRATION / HAPTIC ALERT
+// =========================================================
+
+void vibrationAlert() {
+
+  digitalWrite(
+    VIBRATION_PIN,
+    HIGH
+  );
+
+
+  delay(600);
+
+
+  digitalWrite(
+    VIBRATION_PIN,
+    LOW
+  );
+
+}
+
+
+// =========================================================
+// SEND LIVE DATA TO APP
+// =========================================================
+
+void sendAppData() {
+
+  static unsigned long previousSend = 0;
+
+
+  if (millis() - previousSend < 1000) {
+
+    return;
+
+  }
+
+
+  previousSend = millis();
+
+
+  float sleepMinutes =
+    totalSleepTime / 60000.0;
+
+
+  float progress = 0;
+
+
+  if (desiredSleepHours > 0) {
+
+    progress =
+
+      sleepMinutes
+
+      /
+
+      (desiredSleepHours * 60.0)
+
+      *
+
+      100.0;
+
+  }
+
+
+  if (progress > 100) {
+
+    progress = 100;
+
+  }
+
+
+  String data = "";
+
+
+  data += "PPG=";
+
+  data += String(filteredPPG, 0);
+
+
+  data += ";HR=";
+
+  data += String(heartRate, 1);
+
+
+  data += ";MOTION=";
+
+  data += String(motionValue);
+
+
+  data += ";STATE=";
+
+  if (isSleeping) {
+
+    data += "SLEEP";
+
+  }
+
+  else {
+
+    data += "AWAKE";
+
+  }
+
+
+  data += ";SLEEP_MIN=";
+
+  data += String(sleepMinutes, 1);
+
+
+  data += ";TARGET_HR=";
+
+  data += String(desiredSleepHours, 1);
+
+
+  data += ";PROGRESS=";
+
+  data += String(progress, 1);
+
+
+  data += ";BASE_HR=";
+
+  data += String(
+    personalizedRestingHR,
+    1
+  );
+
+
+  data += ";STAY_AWAKE=";
+
+  if (stayAwakeActive()) {
+
+    data += "1";
+
+  }
+
+  else {
+
+    data += "0";
+
+  }
+
+
+  Serial.println(data);
+
+
+  if (deviceConnected) {
+
+    pTxCharacteristic->setValue(
+      data.c_str()
+    );
+
+
+    pTxCharacteristic->notify();
+
+  }
+
+}
+
+
+// =========================================================
+// SEND EVENT TO APP
+// =========================================================
+
+void sendBluetoothMessage(
+  String message
+) {
+
+  Serial.println(message);
+
+
+  if (deviceConnected) {
+
+    pTxCharacteristic->setValue(
+      message.c_str()
+    );
+
+
+    pTxCharacteristic->notify();
+
+  }
+
+}
+
+
+// =========================================================
+// RECEIVE COMMANDS FROM APP
+// =========================================================
+
+void handleCommand(
+  String command
+) {
+
+  command.trim();
+
+
+  // -----------------------------------------------------
+  // SET SLEEP GOAL
+  //
+  // Example:
+  // TARGET=9
+  // -----------------------------------------------------
+
+  if (command.startsWith("TARGET=")) {
+
+    String value =
+      command.substring(7);
+
+
+    desiredSleepHours =
+      value.toFloat();
+
+
+    sleepGoalReached = false;
+
+
+    sendBluetoothMessage(
+      "EVENT=TARGET_UPDATED"
+    );
+
+  }
+
+
+  // -----------------------------------------------------
+  // START SLEEP TRACKING
+  // -----------------------------------------------------
+
+  else if (command == "TRACK=ON") {
+
+    trackingEnabled = true;
+
+
+    sendBluetoothMessage(
+      "EVENT=TRACKING_STARTED"
+    );
+
+  }
+
+
+  // -----------------------------------------------------
+  // STOP SLEEP TRACKING
+  // -----------------------------------------------------
+
+  else if (command == "TRACK=OFF") {
+
+    trackingEnabled = false;
+
+
+    sendBluetoothMessage(
+      "EVENT=TRACKING_STOPPED"
+    );
+
+  }
+
+
+  // -----------------------------------------------------
+  // MANUAL STAY-AWAKE BUTTON
+  // -----------------------------------------------------
+
+  else if (command == "AWAKE=ON") {
+
+    manualStayAwake = true;
+
+
+    sendBluetoothMessage(
+      "EVENT=STAY_AWAKE_ON"
+    );
+
+  }
+
+
+  else if (command == "AWAKE=OFF") {
+
+    manualStayAwake = false;
+
+
+    sendBluetoothMessage(
+      "EVENT=STAY_AWAKE_OFF"
+    );
+
+  }
+
+
+  // -----------------------------------------------------
+  // PHONE SENDS CURRENT TIME
+  //
+  // TIME=570
+  //
+  // 570 minutes after midnight = 9:30 AM
+  // -----------------------------------------------------
+
+  else if (command.startsWith("TIME=")) {
+
+    String value =
+      command.substring(5);
+
+
+    currentMinuteOfDay =
+      value.toInt();
+
+  }
+
+
+  // -----------------------------------------------------
+  // ADD STAY-AWAKE WINDOW
+  //
+  // ADDWINDOW=570,620
+  //
+  // 570 = 9:30 AM
+  // 620 = 10:20 AM
+  // -----------------------------------------------------
+
+  else if (command.startsWith(
+             "ADDWINDOW="
+           )) {
+
+    if (windowCount < MAX_WINDOWS) {
+
+      String values =
+        command.substring(10);
+
+
+      int commaPosition =
+        values.indexOf(',');
+
+
+      if (commaPosition > 0) {
+
+        stayAwakeStart[windowCount] =
+
+          values
+          .substring(
+            0,
+            commaPosition
+          )
+          .toInt();
+
+
+        stayAwakeEnd[windowCount] =
+
+          values
+          .substring(
+            commaPosition + 1
+          )
+          .toInt();
+
+
+        windowCount++;
+
+
+        sendBluetoothMessage(
+          "EVENT=WINDOW_ADDED"
+        );
+
+      }
+
+    }
+
+  }
+
+
+  // -----------------------------------------------------
+  // DELETE ALL STAY-AWAKE SCHEDULES
+  // -----------------------------------------------------
+
+  else if (command == "CLEARWINDOWS") {
+
+    windowCount = 0;
+
+
+    sendBluetoothMessage(
+      "EVENT=WINDOWS_CLEARED"
+    );
+
+  }
+
+
+  // -----------------------------------------------------
+  // PERSONAL HEART-RATE CALIBRATION
+  // -----------------------------------------------------
+
+  else if (command == "CALIBRATE") {
+
+    startCalibration();
+
+  }
+
+
+  // -----------------------------------------------------
+  // RESET FOR NEW NIGHT
+  // -----------------------------------------------------
+
+  else if (command == "RESETNIGHT") {
+
+    resetNight();
+
+  }
+
+
+  // -----------------------------------------------------
+  // REQUEST CURRENT STATUS
+  // -----------------------------------------------------
+
+  else if (command == "STATUS") {
+
+    showStatus();
+
+  }
+
+}
+
+
+// =========================================================
+// RESET NIGHT
+// =========================================================
+
+void resetNight() {
+
+  totalSleepTime = 0;
+
+  sleepGoalReached = false;
+
+  isSleeping = false;
+
+  wasSleeping = false;
+
+  possibleSleepStart = 0;
+
+  possibleWakeStart = 0;
+
+
+  sendBluetoothMessage(
+    "EVENT=NIGHT_RESET"
+  );
+
+}
+
+
+// =========================================================
+// PRINT CURRENT STATUS
+// =========================================================
+
+void showStatus() {
+
+  float sleepHours =
+    totalSleepTime /
+    3600000.0;
+
+
+  Serial.println();
+
+  Serial.println(
+    "=============================="
+  );
+
+  Serial.println(
+    "       SLEEPBAND STATUS"
+  );
+
+  Serial.println(
+    "=============================="
+  );
+
+
+  Serial.print(
+    "Bluetooth: "
+  );
+
+
+  if (deviceConnected) {
+
+    Serial.println(
+      "CONNECTED"
+    );
+
+  }
+
+  else {
+
+    Serial.println(
+      "DISCONNECTED"
+    );
+
+  }
+
+
+  Serial.print(
+    "Current State: "
+  );
+
+
+  if (isSleeping) {
+
+    Serial.println(
+      "SLEEPING"
+    );
+
+  }
+
+  else {
+
+    Serial.println(
+      "AWAKE"
+    );
+
+  }
+
+
+  Serial.print(
+    "Heart Rate: "
+  );
+
+  Serial.print(
+    heartRate,
+    1
+  );
+
+  Serial.println(
+    " BPM"
+  );
+
+
+  Serial.print(
+    "Personal Baseline: "
+  );
+
+  Serial.print(
+    personalizedRestingHR,
+    1
+  );
+
+  Serial.println(
+    " BPM"
+  );
+
+
+  Serial.print(
+    "Sleep Tonight: "
+  );
+
+  Serial.print(
+    sleepHours,
+    2
+  );
+
+  Serial.println(
+    " hours"
+  );
+
+
+  Serial.print(
+    "Sleep Goal: "
+  );
+
+  Serial.print(
+    desiredSleepHours,
+    1
+  );
+
+  Serial.println(
+    " hours"
+  );
+
+
+  Serial.print(
+    "Tracking: "
+  );
+
+
+  if (trackingEnabled) {
+
+    Serial.println(
+      "ON"
+    );
+
+  }
+
+  else {
+
+    Serial.println(
+      "OFF"
+    );
+
+  }
+
+
+  Serial.print(
+    "Stay Awake: "
+  );
+
+
+  if (stayAwakeActive()) {
+
+    Serial.println(
+      "ON"
+    );
+
+  }
+
+  else {
+
+    Serial.println(
+      "OFF"
+    );
+
+  }
+
+
+  Serial.print(
+    "PPG Signal Reliable: "
+  );
+
+
+  if (signalReliable) {
+
+    Serial.println(
+      "YES"
+    );
+
+  }
+
+  else {
+
+    Serial.println(
+      "NO - MOTION ARTIFACT"
+    );
+
+  }
+
+
+  Serial.println(
+    "=============================="
+  );
+
+}
